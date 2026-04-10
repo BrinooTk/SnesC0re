@@ -5,10 +5,12 @@
 
 #define MAX_ROMS 4096
 #define MAX_NAME 28
+#define MAX_ROM_DIR 96
 
 struct rom_entry {
     char filename[48];
     char display[MAX_NAME];
+    char source_dir[MAX_ROM_DIR];
 };
 
 struct ext_args {

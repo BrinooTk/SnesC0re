@@ -133,7 +133,51 @@ function Compile-Target {
 
     & $Zig objcopy -O binary $elf $bin
     if ($LASTEXITCODE -ne 0) {
-        throw "objcopy failed: $bin"
+        Write-Warning "zig objcopy failed, using ELF PT_LOAD fallback"
+        $fallback = @'
+import struct
+import sys
+
+elf_path = sys.argv[1]
+bin_path = sys.argv[2]
+
+with open(elf_path, "rb") as f:
+    data = f.read()
+
+if data[:4] != b"\x7fELF":
+    raise SystemExit("Not an ELF file")
+if data[4] != 2 or data[5] != 1:
+    raise SystemExit("Only ELF64 little-endian is supported")
+
+hdr = struct.unpack_from("<HHIQQQIHHHHHH", data, 16)
+e_phoff = hdr[4]
+e_phentsize = hdr[8]
+e_phnum = hdr[9]
+
+segments = []
+for i in range(e_phnum):
+    off = e_phoff + i * e_phentsize
+    p_type, p_flags, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_align = struct.unpack_from("<IIQQQQQQ", data, off)
+    if p_type == 1 and p_filesz > 0:
+        segments.append((p_paddr, p_offset, p_filesz))
+
+if not segments:
+    raise SystemExit("No PT_LOAD segments found")
+
+base = min(seg[0] for seg in segments)
+end = max(seg[0] + seg[2] for seg in segments)
+blob = bytearray(end - base)
+
+for paddr, offset, size in segments:
+    blob[paddr - base:paddr - base + size] = data[offset:offset + size]
+
+with open(bin_path, "wb") as f:
+    f.write(blob)
+'@
+        $fallback | python - $elf $bin
+        if ($LASTEXITCODE -ne 0) {
+            throw "objcopy fallback failed: $bin"
+        }
     }
 
     Get-Item $elf, $bin | Select-Object Name, Length

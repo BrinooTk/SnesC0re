@@ -59,6 +59,39 @@ static int ftp_itoa(char *buf, int val) {
     return len;
 }
 
+static int ftp_same_name(const char *a, const char *b) {
+    for (int i = 0; i < 47; i++) {
+        if (a[i] != b[i]) return 0;
+        if (!a[i]) return 1;
+    }
+    return 1;
+}
+
+static void ftp_copy_text(char *out, int max, const char *s) {
+    int i = 0;
+    if (!out || max <= 0) return;
+    while (s && s[i] && i < max - 1) {
+        out[i] = s[i];
+        i++;
+    }
+    out[i] = 0;
+}
+
+static void ftp_add_rom_entry(struct ftp_ctx *f, const char *fn) {
+    if (!is_rom_file(fn) || !f->roms || f->rom_count >= f->max_roms) return;
+    for (int i = 0; i < f->rom_count; i++) {
+        if (ftp_same_name(f->roms[i].filename, fn)) return;
+    }
+
+    struct rom_entry *r = &f->roms[f->rom_count];
+    int k = 0;
+    while (fn[k] && k < 47) { r->filename[k] = fn[k]; k++; }
+    r->filename[k] = 0;
+    extract_rom_name(fn, r->display, MAX_NAME);
+    ftp_copy_text(r->source_dir, MAX_ROM_DIR, FTP_DEST);
+    f->rom_count++;
+}
+
 static void ftp_close_fd(struct ftp_ctx *f, s32 fd) {
     if (fd >= 0) NC(f->G, f->close_fn, (u64)fd, 0, 0, 0, 0, 0);
 }
@@ -229,17 +262,7 @@ static void cmd_stor(struct ftp_ctx *f, const char *arg) {
     f->file_count++;
     f->total_bytes += file_bytes;
 
-    if (is_rom_file(fn) && f->roms && f->rom_count < f->max_roms) {
-        struct rom_entry *r = &f->roms[f->rom_count];
-        int k = 0;
-        while (fn[k] && k < 47) { r->filename[k] = fn[k]; k++; }
-        r->filename[k] = 0;
-        k = 0;
-        for (int i = 0; fn[i] && fn[i] != '.' && k < MAX_NAME - 1; i++)
-            r->display[k++] = fn[i];
-        r->display[k] = 0;
-        f->rom_count++;
-    }
+    ftp_add_rom_entry(f, fn);
 
     if (f->prog_active && f->total_files > 0) {
         int pct = (f->file_count * 100) / f->total_files;

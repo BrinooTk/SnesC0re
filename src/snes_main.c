@@ -3,10 +3,10 @@
 #include "tables.h"
 #include "snes/snes.h"
 
-#define MENU_W 256
-#define MENU_H 240
+#define MENU_W 384
+#define MENU_H 216
 #define MENU_SCALE_X 5
-#define MENU_SCALE_Y 4
+#define MENU_SCALE_Y 5
 #define MENU_OFF_X ((SCR_W - MENU_W * MENU_SCALE_X) / 2)
 #define MENU_OFF_Y ((SCR_H - MENU_H * MENU_SCALE_Y) / 2)
 
@@ -28,8 +28,9 @@
 #define SNES_PAD_BUF_SIZE 128
 #define SNES_BATTERY_MAX_SIZE 0x20000
 #define SNES_AUTOSAVE_FRAMES 300
+#define SNES_FORCE_NTSC_TIMING 1
 #define SNES_SAVE_DIR_PRIMARY "/savedata0/brunoroque_snes"
-#define SNES_SAVE_DIR_FTP "/av_contents/content_tmp/snes_saves"
+#define SNES_SAVE_DIR_FTP "/av_contents/content_tmp"
 
 #define UI_BG    0
 #define UI_BRAND 1
@@ -58,6 +59,7 @@
 #define BTN_L      0x0400
 #define BTN_R      0x0800
 #define BTN_R2     0x1000
+#define BTN_L2     0x2000
 
 static const u32 ui_palette32[] = {
     0xFF191621, 0xFFF05DA8, 0xFFF5F0FF, 0xFFA691C6, 0xFFFF8FCC,
@@ -92,12 +94,17 @@ static void diag_log(void *G, void *sendto_fn, s32 log_fd, u8 *log_sa,
 static void clear_fb(u32 *fb);
 static u32 align_up_u32(u32 value, u32 alignment);
 static int next_fb_index(int active);
+static const char *path_basename(const char *path);
 static void ui_draw_char(u8 *scr, int x, int y, char ch, u8 color);
 static void ui_draw_str(u8 *scr, int x, int y, const char *s, u8 color);
+static void ui_copy_chunk(char *out, int out_size, const char *s, int start, int max_chars);
+static void ui_draw_str_trunc(u8 *scr, int x, int y, const char *s, int max_chars, u8 color);
 static void ui_draw_centered(u8 *scr, int y, const char *s, u8 color);
 static void ui_draw_hline(u8 *scr, int y, int x1, int x2, u8 color);
 static void ui_fill_rect(u8 *scr, int x, int y, int w, int h, u8 color);
 static void ui_draw_rect(u8 *scr, int x, int y, int w, int h, u8 color);
+static int ui_draw_int(u8 *scr, int x, int y, int value, int min_digits, u8 color);
+static void build_smart_wide_map(u16 *map, int dest_w, int src_w);
 static void ui_draw_shell(u8 *scr, const char *mode, const char *footer);
 static void ui_present_status(void *G, void *vid_flip, void *wait_eq, s32 video, u64 eq,
                               void **fbs, int *active, u32 *total_frames,
@@ -109,10 +116,20 @@ static void audio_push(struct snes_audio *audio, const s16 *samples, int frames)
 static void audio_flush(struct snes_audio *audio);
 static Snes *snes_host_init(struct snes_host_bundle *host);
 static s32 read_native_pad(void *G, void *pad_read, s32 pad_h, u8 *pbuf, u16 *pad_state, int *action);
+static void copy_text(char *out, int max, const char *s);
+static int same_name_limit(const char *a, const char *b, int limit);
+static int add_rom_entry(struct rom_entry *roms, int rom_count, int max_roms,
+                         const char *dir, const char *name);
+static int scan_rom_dir(void *G, void *mmap, void *munmap, void *kopen, void *kclose,
+                        void *getdents, const char *dir,
+                        struct rom_entry *roms, int rom_count, int max_roms);
 static int load_blob_file(void *G, void *kopen, void *kread, void *kclose,
                           const char *path, u8 *buf, int max_size);
 static int write_blob_file(void *G, void *kopen, void *kwrite, void *kclose,
                            const char *path, const u8 *buf, int size);
+static int socket_send_all(void *G, void *send_fn, s32 fd, const void *buf, int size);
+static int sync_battery_save_pc(void *G, void *send_fn, s32 *sync_fd,
+                                const char *save_path, const u8 *buf, int size);
 static void ensure_save_dirs(void *G, void *kmkdir);
 static void build_save_path(char *out, int max, const char *dir, const char *rom_filename);
 static int load_battery_save(void *G, void *kopen, void *kread, void *kclose,
@@ -120,13 +137,47 @@ static int load_battery_save(void *G, void *kopen, void *kread, void *kclose,
                              const char *primary_path, const char *ftp_path);
 static int flush_battery_save(void *G, void *kopen, void *kwrite, void *kclose,
                               Snes *snes, u8 *buf,
-                              const char *primary_path, const char *ftp_path);
+                              const char *primary_path, const char *ftp_path,
+                              int *saved_size);
 
 int str_len(const char *s) {
     int n = 0;
     while (*s++) n++;
     return n;
 }
+
+static const char *rom_scan_dirs[] = {
+    ROM_DIR,
+    "/savedata0/",
+    "/mnt/usb0/",
+    "/mnt/usb0/roms/",
+    "/mnt/usb0/ROMS/",
+    "/mnt/usb0/snes/",
+    "/mnt/usb0/SNES/",
+    "/mnt/usb0/snes/roms/",
+    "/mnt/usb0/SNES/roms/",
+    "/mnt/usb1/",
+    "/mnt/usb1/roms/",
+    "/mnt/usb1/ROMS/",
+    "/mnt/usb1/snes/",
+    "/mnt/usb1/SNES/",
+    "/mnt/usb1/snes/roms/",
+    "/mnt/usb1/SNES/roms/",
+    "/mnt/usb2/",
+    "/mnt/usb2/roms/",
+    "/mnt/usb2/ROMS/",
+    "/mnt/usb2/snes/",
+    "/mnt/usb2/SNES/",
+    "/mnt/usb2/snes/roms/",
+    "/mnt/usb2/SNES/roms/",
+    "/mnt/usb3/",
+    "/mnt/usb3/roms/",
+    "/mnt/usb3/ROMS/",
+    "/mnt/usb3/snes/",
+    "/mnt/usb3/SNES/",
+    "/mnt/usb3/snes/roms/",
+    "/mnt/usb3/SNES/roms/"
+};
 
 int is_rom_file(const char *name) {
     int len = str_len(name);
@@ -146,6 +197,78 @@ void extract_rom_name(const char *fn, char *out, int max) {
         i++;
     }
     out[i] = 0;
+}
+
+static void copy_text(char *out, int max, const char *s) {
+    int i = 0;
+    if (!out || max <= 0) return;
+    while (s && s[i] && i < max - 1) {
+        out[i] = s[i];
+        i++;
+    }
+    out[i] = 0;
+}
+
+static int same_name_limit(const char *a, const char *b, int limit) {
+    for (int i = 0; i < limit; i++) {
+        if (a[i] != b[i]) return 0;
+        if (!a[i]) return 1;
+    }
+    return 1;
+}
+
+static int add_rom_entry(struct rom_entry *roms, int rom_count, int max_roms,
+                         const char *dir, const char *name) {
+    if (!roms || !dir || !name || rom_count >= max_roms || !is_rom_file(name)) return rom_count;
+    for (int i = 0; i < rom_count; i++) {
+        if (same_name_limit(roms[i].filename, name, 47)) return rom_count;
+    }
+
+    struct rom_entry *entry = &roms[rom_count];
+    int k = 0;
+    while (name[k] && k < 47) {
+        entry->filename[k] = name[k];
+        k++;
+    }
+    entry->filename[k] = 0;
+    extract_rom_name(name, entry->display, MAX_NAME);
+    copy_text(entry->source_dir, MAX_ROM_DIR, dir);
+    return rom_count + 1;
+}
+
+static int scan_rom_dir(void *G, void *mmap, void *munmap, void *kopen, void *kclose,
+                        void *getdents, const char *dir,
+                        struct rom_entry *roms, int rom_count, int max_roms) {
+    if (!G || !mmap || !kopen || !kclose || !getdents || !dir || !roms || rom_count >= max_roms) {
+        return rom_count;
+    }
+
+    s32 dfd = (s32)NC(G, kopen, (u64)dir, 0x20000, 0, 0, 0, 0);
+    if (dfd < 0) return rom_count;
+
+    u8 *dbuf = (u8 *)NC(G, mmap, 0, 0x2000, 3, 0x1002, (u64)-1, 0);
+    if ((s64)dbuf != -1) {
+        for (;;) {
+            s32 nread = (s32)NC(G, getdents, (u64)dfd, (u64)dbuf, 0x2000, 0, 0, 0);
+            if (nread <= 0) break;
+            int off = 0;
+            while (off < nread && rom_count < max_roms) {
+                u16 reclen = *(u16 *)(dbuf + off + 4);
+                u8 namlen = *(u8 *)(dbuf + off + 7);
+                char *name = (char *)(dbuf + off + 8);
+                if (reclen == 0) break;
+                if (namlen > 0 && is_rom_file(name)) {
+                    rom_count = add_rom_entry(roms, rom_count, max_roms, dir, name);
+                }
+                off += reclen;
+            }
+            if (rom_count >= max_roms) break;
+        }
+        if (munmap) NC(G, munmap, (u64)dbuf, 0x2000, 0, 0, 0, 0);
+    }
+
+    NC(G, kclose, (u64)dfd, 0, 0, 0, 0, 0);
+    return rom_count;
 }
 
 static void udp_log(void *G, void *sendto_fn, s32 fd, u8 *sa, const char *msg) {
@@ -178,6 +301,15 @@ static int next_fb_index(int active) {
     return active;
 }
 
+static const char *path_basename(const char *path) {
+    const char *last = path ? path : "";
+    while (path && *path) {
+        if (*path == '/' || *path == '\\') last = path + 1;
+        path++;
+    }
+    return last;
+}
+
 static void ui_draw_char(u8 *scr, int x, int y, char ch, u8 color) {
     int idx = 0;
     if (ch >= 'a' && ch <= 'z') ch -= 32;
@@ -201,6 +333,51 @@ static void ui_draw_str(u8 *scr, int x, int y, const char *s, u8 color) {
         x += 8;
         s++;
     }
+}
+
+static void ui_copy_chunk(char *out, int out_size, const char *s, int start, int max_chars) {
+    int i = 0;
+    if (!out || out_size <= 0) return;
+    if (!s || start < 0 || max_chars <= 0) {
+        out[0] = 0;
+        return;
+    }
+    while (s[start] && i < max_chars && i < out_size - 1) {
+        out[i++] = s[start++];
+    }
+    out[i] = 0;
+}
+
+static void ui_draw_str_trunc(u8 *scr, int x, int y, const char *s, int max_chars, u8 color) {
+    char tmp[48];
+    int len = 0;
+    int keep;
+    if (!s || max_chars <= 0) return;
+    while (s[len]) len++;
+    if (len <= max_chars) {
+        ui_draw_str(scr, x, y, s, color);
+        return;
+    }
+
+    keep = max_chars;
+    if (keep > (int)sizeof(tmp) - 1) keep = (int)sizeof(tmp) - 1;
+    if (keep <= 0) return;
+
+    if (keep <= 3) {
+        for (int i = 0; i < keep; i++) tmp[i] = '.';
+        tmp[keep] = 0;
+    } else {
+        int i = 0;
+        while (i < keep - 3) {
+            tmp[i] = s[i];
+            i++;
+        }
+        tmp[i++] = '.';
+        tmp[i++] = '.';
+        tmp[i++] = '.';
+        tmp[i] = 0;
+    }
+    ui_draw_str(scr, x, y, tmp, color);
 }
 
 static void ui_draw_centered(u8 *scr, int y, const char *s, u8 color) {
@@ -236,27 +413,79 @@ static void ui_draw_rect(u8 *scr, int x, int y, int w, int h, u8 color) {
     ui_fill_rect(scr, x + w - 1, y, 1, h, color);
 }
 
+static int ui_draw_int(u8 *scr, int x, int y, int value, int min_digits, u8 color) {
+    char buf[12];
+    int digits = 0;
+    int draw = 0;
+
+    if (value < 0) value = 0;
+    do {
+        buf[digits++] = (char)('0' + (value % 10));
+        value /= 10;
+    } while (value > 0 && digits < (int)sizeof(buf) - 1);
+
+    while (digits < min_digits && digits < (int)sizeof(buf) - 1) {
+        buf[digits++] = '0';
+    }
+
+    while (digits > 0) {
+        ui_draw_char(scr, x + draw * 8, y, buf[--digits], color);
+        draw++;
+    }
+    return draw * 8;
+}
+
+static void build_smart_wide_map(u16 *map, int dest_w, int src_w) {
+    int center_dest = (dest_w * 58) / 100;
+    int center_src = (src_w * 74) / 100;
+    int side_dest = (dest_w - center_dest) / 2;
+    int side_src = (src_w - center_src) / 2;
+
+    if (!map || dest_w <= 0 || src_w <= 0) return;
+    if (side_dest <= 0 || side_src <= 0 || center_dest <= 0 || center_src <= 0) {
+        for (int dx = 0; dx < dest_w; dx++) map[dx] = (u16)((dx * src_w) / dest_w);
+        return;
+    }
+
+    for (int dx = 0; dx < dest_w; dx++) {
+        int src_x;
+        if (dx < side_dest) {
+            src_x = (dx * side_src) / side_dest;
+        } else if (dx < side_dest + center_dest) {
+            src_x = side_src + ((dx - side_dest) * center_src) / center_dest;
+        } else {
+            src_x = side_src + center_src + ((dx - side_dest - center_dest) * side_src) / side_dest;
+        }
+        if (src_x >= src_w) src_x = src_w - 1;
+        map[dx] = (u16)src_x;
+    }
+}
+
 static void ui_draw_shell(u8 *scr, const char *mode, const char *footer) {
     for (int i = 0; i < MENU_W * MENU_H; i++) scr[i] = UI_BG;
 
     ui_fill_rect(scr, 0, 0, MENU_W, MENU_H, UI_BG);
     for (int band = 0; band < 6; band++) {
-        int y = 48 + band * 28;
-        ui_fill_rect(scr, 0, y, MENU_W, 12, (band & 1) ? UI_PANEL : UI_PANEL2);
+        int y = 46 + band * 24;
+        ui_fill_rect(scr, 0, y, MENU_W, 14, (band & 1) ? UI_PANEL : UI_PANEL2);
     }
 
-    ui_fill_rect(scr, 0, 0, MENU_W, 18, UI_ACCENT);
-    ui_fill_rect(scr, 0, 18, MENU_W, 20, UI_PANEL2);
-    ui_fill_rect(scr, 0, MENU_H - 22, MENU_W, 22, UI_PANEL2);
+    ui_fill_rect(scr, 0, 0, MENU_W, 16, UI_ACCENT);
+    ui_fill_rect(scr, 0, 16, MENU_W, 20, UI_PANEL2);
+    ui_fill_rect(scr, 0, MENU_H - 24, MENU_W, 24, UI_PANEL2);
 
-    ui_fill_rect(scr, 10, 48, MENU_W - 20, MENU_H - 78, UI_PANEL);
-    ui_draw_rect(scr, 8, 46, MENU_W - 16, MENU_H - 74, UI_LINE);
-    ui_draw_rect(scr, 14, 52, MENU_W - 28, MENU_H - 86, UI_PANEL2);
+    ui_fill_rect(scr, 14, 42, MENU_W - 28, MENU_H - 76, UI_PANEL);
+    ui_draw_rect(scr, 10, 38, MENU_W - 20, MENU_H - 64, UI_LINE);
+    ui_draw_hline(scr, 48, 18, MENU_W - 18, UI_PANEL2);
 
-    ui_fill_rect(scr, 16, 12, 56, 12, UI_BRAND);
-    ui_draw_centered(scr, 4, "BRUNOROQUE", UI_BLACK);
-    ui_draw_centered(scr, 22, "SNESC0RE", UI_HEAD);
-    if (mode) ui_draw_centered(scr, 32, mode, UI_DIM);
+    ui_fill_rect(scr, 18, 8, 64, 10, UI_BRAND);
+    ui_draw_str(scr, 26, 9, "SNES", UI_BLACK);
+    ui_draw_str(scr, 18, 24, "SNESC0RE", UI_HEAD);
+    if (mode) {
+        int mode_x = MENU_W - 18 - str_len(mode) * 8;
+        if (mode_x < 122) mode_x = 122;
+        ui_draw_str(scr, mode_x, 24, mode, UI_DIM);
+    }
     if (footer) ui_draw_centered(scr, MENU_H - 14, footer, UI_DIM);
 }
 
@@ -264,11 +493,11 @@ static void ui_present_status(void *G, void *vid_flip, void *wait_eq, s32 video,
                               void **fbs, int *active, u32 *total_frames,
                               u8 *scr, const char *title, const char *line1, const char *line2) {
     ui_draw_shell(scr, "SYSTEM STATUS", "CHECK PC LOG WINDOW");
-    ui_fill_rect(scr, 28, 88, 200, 64, UI_PANEL2);
-    ui_draw_rect(scr, 26, 86, 204, 68, UI_LINE);
-    if (title) ui_draw_centered(scr, 98, title, UI_SEL);
-    if (line1) ui_draw_centered(scr, 116, line1, UI_TEXT);
-    if (line2) ui_draw_centered(scr, 130, line2, UI_DIM);
+    ui_fill_rect(scr, 56, 84, MENU_W - 112, 58, UI_PANEL2);
+    ui_draw_rect(scr, 50, 78, MENU_W - 100, 70, UI_LINE);
+    if (title) ui_draw_centered(scr, 92, title, UI_SEL);
+    if (line1) ui_draw_centered(scr, 110, line1, UI_TEXT);
+    if (line2) ui_draw_centered(scr, 124, line2, UI_DIM);
 
     scale_menu_to_framebuf((u32 *)fbs[*active], scr);
     NC(G, vid_flip, (u64)video, (u64)*active, 1, *total_frames, 0, 0);
@@ -297,24 +526,28 @@ static void scale_menu_to_framebuf(u32 *fb, const u8 *scr) {
 }
 
 static void scale_snes_to_framebuf(u32 *fb, const u8 *pixels, int widescreen) {
+    static u16 wide_map[SNES_WIDE_W];
+    static int wide_map_ready = 0;
     int dest_w = widescreen ? SNES_WIDE_W : SNES_NATIVE_W;
-    int dest_x = (SCR_W - dest_w) / 2;
+    int dest_x = widescreen ? (SCR_W - SNES_WIDE_W) / 2 : SNES_OFF_X;
+
+    if (widescreen && !wide_map_ready) {
+        build_smart_wide_map(wide_map, SNES_WIDE_W, SNES_FB_W);
+        wide_map_ready = 1;
+    }
 
     for (int y = 0; y < SNES_FB_H; y++) {
         int sy = SNES_OFF_Y + y * SNES_SCALE;
-        // Force a stable progressive image on the PS5 output path.
-        // For normal SNES content the emulator already duplicates rows in pairs,
-        // so sampling the even row of each pair avoids parity wobble/scanline tremor.
         const u8 *src_row = pixels + (y & ~1) * SNES_FB_W * 4;
+        u32 *dst_row0 = fb + sy * SCR_W + dest_x;
+        u32 *dst_row1 = dst_row0 + SCR_W;
+
         for (int dx = 0; dx < dest_w; dx++) {
-            int src_x = widescreen ? (dx * SNES_FB_W) / dest_w : (dx >> 1);
+            int src_x = widescreen ? wide_map[dx] : (dx >> 1);
             const u8 *px = src_row + src_x * 4;
-            // We request XRGB output from the core, so bytes 0..2 map to B,G,R.
             u32 color = 0xFF000000 | ((u32)px[2] << 16) | ((u32)px[1] << 8) | (u32)px[0];
-            int sx = dest_x + dx;
-            for (int dy = 0; dy < SNES_SCALE; dy++) {
-                fb[(sy + dy) * SCR_W + sx] = color;
-            }
+            dst_row0[dx] = color;
+            dst_row1[dx] = color;
         }
     }
 }
@@ -413,6 +646,7 @@ static u16 ds_to_snes(u32 raw, int *action) {
     if (raw & 0x00000020) out |= BTN_RIGHT;
     if (raw & 0x00002000) out |= BTN_A;
     if (raw & 0x00001000) out |= BTN_X;
+    if (raw & 0x00000100) out |= BTN_L2;
     if (raw & 0x00000400) out |= BTN_L;
     if (raw & 0x00000800) out |= BTN_R;
     if (raw & 0x00000200) out |= BTN_R2;
@@ -469,6 +703,47 @@ static void ensure_save_dirs(void *G, void *kmkdir) {
     NC(G, kmkdir, (u64)SNES_SAVE_DIR_FTP, 0x1FF, 0, 0, 0, 0);
 }
 
+static int socket_send_all(void *G, void *send_fn, s32 fd, const void *buf, int size) {
+    const u8 *ptr = (const u8 *)buf;
+    while (size > 0) {
+        s32 sent = (s32)NC(G, send_fn, (u64)fd, (u64)ptr, (u64)size, 0, 0, 0);
+        if (sent <= 0) return 0;
+        ptr += sent;
+        size -= sent;
+    }
+    return 1;
+}
+
+static int sync_battery_save_pc(void *G, void *send_fn, s32 *sync_fd,
+                                const char *save_path, const u8 *buf, int size) {
+    if (!send_fn || !sync_fd || !save_path || !buf || size <= 0) return 0;
+    if (*sync_fd < 0) return 0;
+
+    const char *name = path_basename(save_path);
+    int name_len = str_len(name);
+    if (name_len <= 0 || name_len > 240) return 0;
+
+    u8 header[10];
+    header[0] = 'S';
+    header[1] = 'S';
+    header[2] = 'V';
+    header[3] = '1';
+    header[4] = (u8)(name_len & 0xFF);
+    header[5] = (u8)((name_len >> 8) & 0xFF);
+    header[6] = (u8)(size & 0xFF);
+    header[7] = (u8)((size >> 8) & 0xFF);
+    header[8] = (u8)((size >> 16) & 0xFF);
+    header[9] = (u8)((size >> 24) & 0xFF);
+
+    if (!socket_send_all(G, send_fn, *sync_fd, header, sizeof(header)) ||
+        !socket_send_all(G, send_fn, *sync_fd, name, name_len) ||
+        !socket_send_all(G, send_fn, *sync_fd, buf, size)) {
+        *sync_fd = -1;
+        return -1;
+    }
+    return 1;
+}
+
 static void build_save_path(char *out, int max, const char *dir, const char *rom_filename) {
     int pos = 0;
     if (!out || max <= 0) return;
@@ -496,8 +771,8 @@ static int load_battery_save(void *G, void *kopen, void *kread, void *kclose,
                              Snes *snes, u8 *buf, int max_size,
                              const char *primary_path, const char *ftp_path) {
     if (!snes || !snes->cart || snes->cart->ramSize <= 0 || !buf) return 0;
-    int size = load_blob_file(G, kopen, kread, kclose, primary_path, buf, max_size);
-    if (size <= 0) size = load_blob_file(G, kopen, kread, kclose, ftp_path, buf, max_size);
+    int size = load_blob_file(G, kopen, kread, kclose, ftp_path, buf, max_size);
+    if (size <= 0) size = load_blob_file(G, kopen, kread, kclose, primary_path, buf, max_size);
     if (size <= 0) return 0;
     if (!snes_loadBattery(snes, buf, size)) return -1;
     snes->cart->batteryDirty = false;
@@ -506,7 +781,8 @@ static int load_battery_save(void *G, void *kopen, void *kread, void *kclose,
 
 static int flush_battery_save(void *G, void *kopen, void *kwrite, void *kclose,
                               Snes *snes, u8 *buf,
-                              const char *primary_path, const char *ftp_path) {
+                              const char *primary_path, const char *ftp_path,
+                              int *saved_size) {
     if (!snes || !snes->cart || snes->cart->ramSize <= 0 || !buf) return 0;
     int size = snes_saveBattery(snes, buf);
     if (size <= 0) return 0;
@@ -514,8 +790,10 @@ static int flush_battery_save(void *G, void *kopen, void *kwrite, void *kclose,
     int ftp_ok = write_blob_file(G, kopen, kwrite, kclose, ftp_path, buf, size);
     if (primary_ok || ftp_ok) {
         snes->cart->batteryDirty = false;
+        if (saved_size) *saved_size = size;
         return 1;
     }
+    if (saved_size) *saved_size = size;
     return 0;
 }
 
@@ -542,11 +820,13 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     void *kwrite    = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelWrite");
     void *kmkdir    = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelMkdir");
     void *recvfrom  = SYM(G, D, LIBKERNEL_HANDLE, "recvfrom");
+    void *send_fn   = SYM(G, D, LIBKERNEL_HANDLE, "send");
     void *sendto_fn = SYM(G, D, LIBKERNEL_HANDLE, "sendto");
     void *accept    = SYM(G, D, LIBKERNEL_HANDLE, "accept");
     void *getsockname_fn = SYM(G, D, LIBKERNEL_HANDLE, "getsockname");
     void *getdents  = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelGetdents");
     if (!getdents) getdents = SYM(G, D, LIBKERNEL_HANDLE, "getdents");
+    if (!send_fn) send_fn = sendto_fn;
 
     s32 log_fd = ext->log_fd;
     u8 log_sa[16];
@@ -556,6 +836,7 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     s32 userId = (s32)ext->dbg[3];
     s32 ftp_fd = (s32)ext->dbg[4];
     s32 ftp_data_fd = (s32)ext->dbg[5];
+    s32 save_sync_fd = (s32)ext->dbg[6];
 
     if (!usleep || !load_mod || !mmap) {
         ext->status = -1;
@@ -672,15 +953,14 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
 
     struct rom_entry *roms = (struct rom_entry *)NC(G, mmap, 0, sizeof(struct rom_entry) * MAX_ROMS, 3, 0x1002, (u64)-1, 0);
     int rom_count = 0;
-    const char *rom_dir = ROM_DIR;
 
     if ((s64)roms != -1) {
         ui_draw_shell(menu_scr, "FTP TRANSFER MODE", "SEND ROMS FROM YOUR PC");
-        ui_fill_rect(menu_scr, 24, 92, 208, 54, UI_PANEL2);
-        ui_draw_rect(menu_scr, 22, 90, 212, 58, UI_LINE);
-        ui_draw_centered(menu_scr, 102, "SNESC0RE IS READY", UI_SEL);
-        ui_draw_centered(menu_scr, 118, "FTP SERVER ON PORT 1337", UI_TEXT);
-        ui_draw_centered(menu_scr, 132, "WAITING FOR ROMS...", UI_DIM);
+        ui_fill_rect(menu_scr, 54, 84, MENU_W - 108, 54, UI_PANEL2);
+        ui_draw_rect(menu_scr, 48, 78, MENU_W - 96, 66, UI_LINE);
+        ui_draw_centered(menu_scr, 92, "SNESC0RE IS READY", UI_SEL);
+        ui_draw_centered(menu_scr, 108, "FTP SERVER ON PORT 1337", UI_TEXT);
+        ui_draw_centered(menu_scr, 124, "WAITING FOR ROMS...", UI_DIM);
         scale_menu_to_framebuf((u32 *)fbs[0], menu_scr);
         scale_menu_to_framebuf((u32 *)fbs[1], menu_scr);
         scale_menu_to_framebuf((u32 *)fbs[2], menu_scr);
@@ -695,48 +975,10 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     }
 
     if (kopen && getdents && (s64)roms != -1) {
-        s32 dfd = (s32)NC(G, kopen, (u64)ROM_DIR, 0x20000, 0, 0, 0, 0);
-        if (dfd < 0) {
-            rom_dir = "/savedata0/";
-            dfd = (s32)NC(G, kopen, (u64)"/savedata0/", 0x20000, 0, 0, 0, 0);
-        }
-        if (dfd >= 0) {
-            u8 *dbuf = (u8 *)NC(G, mmap, 0, 0x2000, 3, 0x1002, (u64)-1, 0);
-            if ((s64)dbuf != -1) {
-                for (;;) {
-                    s32 nread = (s32)NC(G, getdents, (u64)dfd, (u64)dbuf, 0x2000, 0, 0, 0);
-                    if (nread <= 0) break;
-                    int off = 0;
-                    while (off < nread && rom_count < MAX_ROMS) {
-                        u16 reclen = *(u16 *)(dbuf + off + 4);
-                        u8 namlen = *(u8 *)(dbuf + off + 7);
-                        char *name = (char *)(dbuf + off + 8);
-                        if (reclen == 0) break;
-                        if (namlen > 0 && is_rom_file(name)) {
-                            int dup = 0;
-                            for (int j = 0; j < rom_count; j++) {
-                                int match = 1;
-                                for (int c = 0; c < 47; c++) {
-                                    if (roms[j].filename[c] != name[c]) { match = 0; break; }
-                                    if (!name[c]) break;
-                                }
-                                if (match) { dup = 1; break; }
-                            }
-                            if (!dup) {
-                                int k = 0;
-                                while (name[k] && k < 47) { roms[rom_count].filename[k] = name[k]; k++; }
-                                roms[rom_count].filename[k] = 0;
-                                extract_rom_name(name, roms[rom_count].display, MAX_NAME);
-                                rom_count++;
-                            }
-                        }
-                        off += reclen;
-                    }
-                    if (rom_count >= MAX_ROMS) break;
-                }
-                if (munmap) NC(G, munmap, (u64)dbuf, 0x2000, 0, 0, 0, 0);
-            }
-            NC(G, kclose, (u64)dfd, 0, 0, 0, 0, 0);
+        for (u32 i = 0; i < (u32)(sizeof(rom_scan_dirs) / sizeof(rom_scan_dirs[0])); i++) {
+            rom_count = scan_rom_dir(G, mmap, munmap, kopen, kclose, getdents,
+                                     rom_scan_dirs[i], roms, rom_count, MAX_ROMS);
+            if (rom_count >= MAX_ROMS) break;
         }
     }
 
@@ -746,12 +988,12 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
         int selected = 0;
         if (rom_count <= 0) {
             for (int f = 0; f < 300; f++) {
-                ui_draw_shell(menu_scr, "LIBRARY EMPTY", "PLACE ROMS IN FTP OR /SAVEDATA0/");
-                ui_fill_rect(menu_scr, 28, 92, 200, 54, UI_PANEL2);
-                ui_draw_rect(menu_scr, 26, 90, 204, 58, UI_LINE);
-                ui_draw_centered(menu_scr, 102, "NO ROMS FOUND", UI_SEL);
-                ui_draw_centered(menu_scr, 118, "ADD .SFC OR .SMC FILES", UI_TEXT);
-                ui_draw_centered(menu_scr, 132, "THEN REOPEN THE MENU", UI_DIM);
+                ui_draw_shell(menu_scr, "LIBRARY EMPTY", "FTP / SAVEDATA0 / USB");
+                ui_fill_rect(menu_scr, 54, 84, MENU_W - 108, 54, UI_PANEL2);
+                ui_draw_rect(menu_scr, 48, 78, MENU_W - 96, 66, UI_LINE);
+                ui_draw_centered(menu_scr, 92, "NO ROMS FOUND", UI_SEL);
+                ui_draw_centered(menu_scr, 108, "ADD .SFC OR .SMC FILES", UI_TEXT);
+                ui_draw_centered(menu_scr, 124, "THEN REOPEN THE MENU", UI_DIM);
                 scale_menu_to_framebuf((u32 *)fbs[active], menu_scr);
                 NC(G, vid_flip, (u64)video, (u64)active, 1, (u64)f, 0, 0);
                 if (eq && wait_eq) {
@@ -768,7 +1010,7 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
             int cursor = 0, scroll = 0, mframe = 0, hold = 0;
             u16 prev_btn = 0;
             int require_release = 1;
-            int visible = 15;
+            int visible = 9;
             if (visible > rom_count) visible = rom_count;
 
             for (;;) {
@@ -813,42 +1055,71 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
                 }
 
                 prev_btn = btn;
-                ui_draw_shell(menu_scr, "SNES LIBRARY", "B/START OPEN  R3 EXIT");
-                ui_fill_rect(menu_scr, 18, 52, 62, 14, UI_PANEL2);
-                ui_draw_rect(menu_scr, 16, 50, 66, 18, UI_LINE);
-                ui_draw_str(menu_scr, 24, 55, "ROMS", UI_NUM);
-                if (rom_count >= 10) {
-                    ui_draw_char(menu_scr, 56, 55, '0' + ((rom_count / 10) % 10), UI_HEAD);
-                    ui_draw_char(menu_scr, 64, 55, '0' + (rom_count % 10), UI_HEAD);
-                } else {
-                    ui_draw_char(menu_scr, 64, 55, '0' + rom_count, UI_HEAD);
+                ui_draw_shell(menu_scr, "GAME LIBRARY", 0);
+
+                ui_fill_rect(menu_scr, 18, 50, 188, 136, UI_PANEL2);
+                ui_draw_rect(menu_scr, 16, 48, 192, 140, UI_LINE);
+                ui_fill_rect(menu_scr, 24, 54, 76, 12, UI_BRAND);
+                ui_draw_str(menu_scr, 32, 56, "LIBRARY", UI_BLACK);
+                ui_draw_int(menu_scr, 172, 56, rom_count, 2, UI_HEAD);
+
+                ui_fill_rect(menu_scr, 220, 50, 146, 60, UI_PANEL2);
+                ui_draw_rect(menu_scr, 218, 48, 150, 64, UI_LINE);
+                ui_fill_rect(menu_scr, 226, 54, 84, 12, UI_BRAND);
+                ui_draw_str(menu_scr, 234, 56, "SELECTED", UI_BLACK);
+                {
+                    char sel_line1[17];
+                    char sel_line2[17];
+                    int px = 272;
+                    ui_copy_chunk(sel_line1, sizeof(sel_line1), roms[cursor].display, 0, 16);
+                    ui_copy_chunk(sel_line2, sizeof(sel_line2), roms[cursor].display, 16, 16);
+                    ui_draw_str_trunc(menu_scr, 232, 72, sel_line1[0] ? sel_line1 : "-", 16, UI_TEXT);
+                    if (sel_line2[0]) ui_draw_str_trunc(menu_scr, 232, 84, sel_line2, 16, UI_TEXT);
+                    else ui_draw_str(menu_scr, 232, 84, "READY TO LOAD", UI_DIM);
+                    ui_draw_str(menu_scr, 232, 96, "ENTRY", UI_NUM);
+                    px += ui_draw_int(menu_scr, px, 96, cursor + 1, 3, UI_HEAD);
+                    ui_draw_char(menu_scr, px, 96, '/', UI_DIM);
+                    px += 8;
+                    ui_draw_int(menu_scr, px, 96, rom_count, 3, UI_TEXT);
                 }
 
-                if (scroll > 0) ui_draw_centered(menu_scr, 44, "+", UI_ACCENT);
+                ui_fill_rect(menu_scr, 220, 118, 146, 40, UI_PANEL2);
+                ui_draw_rect(menu_scr, 218, 116, 150, 44, UI_LINE);
+                ui_fill_rect(menu_scr, 226, 122, 62, 12, UI_BRAND);
+                ui_draw_str(menu_scr, 234, 124, "STATUS", UI_BLACK);
+                ui_draw_str(menu_scr, 232, 138, "AUTO SAVE SYNC", UI_TEXT);
+                ui_draw_str(menu_scr, 232, 148, ".SFC / .SMC READY", UI_DIM);
 
-                int ly = 54;
+                ui_fill_rect(menu_scr, 220, 166, 146, 18, UI_PANEL2);
+                ui_draw_rect(menu_scr, 218, 164, 150, 22, UI_LINE);
+                ui_draw_str(menu_scr, 232, 171, "PRESS B OR START", UI_TEXT);
+
+                if (scroll > 0) ui_draw_char(menu_scr, 188, 72, '+', UI_ACCENT);
+
+                int ly = 74;
                 for (int i = 0; i < visible && scroll + i < rom_count; i++) {
                     int idx = scroll + i;
-                    int iy = ly + i * 10;
+                    int iy = ly + i * 12;
                     int sel = (idx == cursor);
                     int num = idx + 1;
+                    int nx = 42;
                     if (sel) {
-                        ui_fill_rect(menu_scr, 18, iy - 1, 220, 10, ((mframe / 10) % 2) ? UI_SEL : UI_BRAND);
-                        ui_draw_rect(menu_scr, 16, iy - 2, 224, 12, UI_LINE);
+                        ui_fill_rect(menu_scr, 24, iy - 2, 176, 11, UI_SEL);
+                        ui_draw_rect(menu_scr, 22, iy - 4, 180, 15, UI_LINE);
+                        if (((mframe / 14) & 1) == 0) ui_draw_char(menu_scr, 30, iy, '>', UI_BLACK);
                     }
-                    if (sel && ((mframe / 10) % 2)) ui_draw_char(menu_scr, 22, iy, '>', UI_CUR);
                     u8 nc = sel ? UI_BLACK : UI_NUM;
-                    int nx = 34;
-                    if (rom_count >= 100) { ui_draw_char(menu_scr, nx, iy, '0' + num / 100, nc); nx += 8; }
-                    ui_draw_char(menu_scr, nx, iy, '0' + (num / 10) % 10, nc); nx += 8;
-                    ui_draw_char(menu_scr, nx, iy, '0' + (num % 10), nc); nx += 8;
+                    nx += ui_draw_int(menu_scr, nx, iy, num, 3, nc);
                     ui_draw_char(menu_scr, nx, iy, '.', nc); nx += 8;
-                    ui_draw_str(menu_scr, nx + 2, iy, roms[idx].display, sel ? UI_BLACK : UI_TEXT);
+                    ui_draw_str_trunc(menu_scr, nx + 6, iy, roms[idx].display, 16, sel ? UI_BLACK : UI_TEXT);
                 }
 
-                if (scroll + visible < rom_count) ui_draw_centered(menu_scr, ly + visible * 10, "+", UI_ACCENT);
-                ui_draw_centered(menu_scr, 204, "DOWN+L1+START MENU", UI_DIM);
-                ui_draw_centered(menu_scr, 214, "L1+R1+START+R2 WIDE", UI_DIM);
+                if (scroll + visible < rom_count) ui_draw_char(menu_scr, 188, ly + visible * 12 - 2, '+', UI_ACCENT);
+
+                ui_fill_rect(menu_scr, 18, 192, 348, 16, UI_PANEL2);
+                ui_draw_rect(menu_scr, 16, 190, 352, 20, UI_LINE);
+                ui_draw_centered(menu_scr, 194, "OPEN B/START  MENU D+L1+START  R3 EXIT", UI_DIM);
+                ui_draw_centered(menu_scr, 204, "WIDE L1+R1+ST+R2  QUIT L1+R1+L2+R2+ST", UI_DIM);
 
                 scale_menu_to_framebuf((u32 *)fbs[active], menu_scr);
                 NC(G, vid_flip, (u64)video, (u64)active, 1, total_frames, 0, 0);
@@ -863,15 +1134,15 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
             }
         }
 
-        char rom_path[96];
+        char rom_path[160];
         char save_primary_path[160];
         char save_ftp_path[160];
         {
             int pi = 0;
-            const char *p = rom_dir;
-            while (*p) rom_path[pi++] = *p++;
+            const char *p = roms[selected].source_dir[0] ? roms[selected].source_dir : ROM_DIR;
+            while (*p && pi < (int)sizeof(rom_path) - 2) rom_path[pi++] = *p++;
             const char *f = roms[selected].filename;
-            while (*f && pi < 94) rom_path[pi++] = *f++;
+            while (*f && pi < (int)sizeof(rom_path) - 1) rom_path[pi++] = *f++;
             rom_path[pi] = 0;
             build_save_path(save_primary_path, sizeof(save_primary_path), SNES_SAVE_DIR_PRIMARY, roms[selected].filename);
             build_save_path(save_ftp_path, sizeof(save_ftp_path), SNES_SAVE_DIR_FTP, roms[selected].filename);
@@ -1011,6 +1282,13 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
             }
         }
 
+#if SNES_FORCE_NTSC_TIMING
+        if (snes->palTiming) {
+            snes->palTiming = false;
+            diag_log(G, sendto_fn, log_fd, log_sa, kwrite, diag_fd, "PAL ROM FORCED TO 60HZ\n");
+        }
+#endif
+
         diag_log(G, sendto_fn, log_fd, log_sa, kwrite, diag_fd, rom_path);
         diag_log(G, sendto_fn, log_fd, log_sa, kwrite, diag_fd, snes->palTiming ? " PAL\n" : " NTSC\n");
 
@@ -1018,7 +1296,7 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
         int pal_acc = 60;
         int debug_combo_latch = 0;
         int widescreen = 0;
-        int video_layout_dirty = 0;
+        int video_layout_dirty = 1;
         int autosave_counter = 0;
         back_to_menu = 0;
         ext->step = 62;
@@ -1037,13 +1315,18 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
                 back_to_menu = 1;
                 break;
             }
+            if ((pad_state & (BTN_L | BTN_R | BTN_L2 | BTN_R2 | BTN_START)) ==
+                (BTN_L | BTN_R | BTN_L2 | BTN_R2 | BTN_START)) {
+                want_exit = 1;
+                break;
+            }
             if ((pad_state & (BTN_L | BTN_R | BTN_START | BTN_R2)) == (BTN_L | BTN_R | BTN_START | BTN_R2)) {
                 if (!debug_combo_latch) {
                     widescreen = !widescreen;
                     video_layout_dirty = 1;
                     diag_log(
                         G, sendto_fn, log_fd, log_sa, kwrite, diag_fd,
-                        widescreen ? "WIDESCREEN ON\n" : "WIDESCREEN OFF\n"
+                        widescreen ? "SMART WIDE ON\n" : "SMART WIDE OFF\n"
                     );
                     debug_combo_latch = 1;
                 }
@@ -1112,8 +1395,13 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
             if (battery_enabled && snes->cart->batteryDirty) {
                 autosave_counter++;
                 if (autosave_counter >= SNES_AUTOSAVE_FRAMES) {
-                    if (!flush_battery_save(G, kopen, kwrite, kclose, snes, battery_buf, save_primary_path, save_ftp_path)) {
+                    int saved_size = 0;
+                    if (!flush_battery_save(
+                            G, kopen, kwrite, kclose, snes, battery_buf,
+                            save_primary_path, save_ftp_path, &saved_size)) {
                         diag_log(G, sendto_fn, log_fd, log_sa, kwrite, diag_fd, "SNES battery autosave failed\n");
+                    } else if (sync_battery_save_pc(G, send_fn, &save_sync_fd, save_primary_path, battery_buf, saved_size) < 0) {
+                        diag_log(G, sendto_fn, log_fd, log_sa, kwrite, diag_fd, "SNES battery PC sync failed\n");
                     }
                     autosave_counter = 0;
                 }
@@ -1154,8 +1442,14 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
 
 game_cleanup:
         if (battery_enabled && snes && snes->cart && snes->cart->batteryDirty) {
-            if (flush_battery_save(G, kopen, kwrite, kclose, snes, battery_buf, save_primary_path, save_ftp_path)) {
+            int saved_size = 0;
+            if (flush_battery_save(
+                    G, kopen, kwrite, kclose, snes, battery_buf,
+                    save_primary_path, save_ftp_path, &saved_size)) {
                 diag_log(G, sendto_fn, log_fd, log_sa, kwrite, diag_fd, "SNES battery saved\n");
+                if (sync_battery_save_pc(G, send_fn, &save_sync_fd, save_primary_path, battery_buf, saved_size) < 0) {
+                    diag_log(G, sendto_fn, log_fd, log_sa, kwrite, diag_fd, "SNES battery PC sync failed\n");
+                }
             } else {
                 diag_log(G, sendto_fn, log_fd, log_sa, kwrite, diag_fd, "SNES battery save failed\n");
             }

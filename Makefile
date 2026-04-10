@@ -1,4 +1,4 @@
-PROJECT_ROOT := $(abspath .)
+PROJECT_ROOT := $(abspath ..)
 BUILD_DIR    := $(PROJECT_ROOT)/compiled
 OBJ_DIR      := $(BUILD_DIR)/obj
 

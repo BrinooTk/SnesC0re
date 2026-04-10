@@ -17,13 +17,12 @@ def calc_jit_size(bin_size):
 
 def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    project_root = script_dir
+    project_root = os.path.dirname(script_dir)
     compiled_dir = os.path.join(project_root, "compiled")
-    template_path = os.path.join(project_root, "snes_template.lua")
 
-    parser = argparse.ArgumentParser(description="Generate compiled/snes.lua from compiled/snes_emu.bin")
+    parser = argparse.ArgumentParser(description="Generate snes.lua from snes_emu.bin using the current snes.lua as a base template")
     parser.add_argument("--bin", default=os.path.join(compiled_dir, "snes_emu.bin"), help="Path to snes_emu.bin")
-    parser.add_argument("--template", default=template_path, help="Lua template to use as a base")
+    parser.add_argument("--template", default=os.path.join(compiled_dir, "snes.lua"), help="Lua template to use as a base")
     parser.add_argument("--out", default=os.path.join(compiled_dir, "snes.lua"), help="Output lua file")
     parser.add_argument("--pc-ip", default=None, help="Override PC_IP inside the Lua launcher")
     args = parser.parse_args()
